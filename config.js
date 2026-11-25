@@ -6,10 +6,10 @@
    ============================================================ */
 window.MZ_CONFIG = {
   firebase: {
-    apiKey: "",
-    authDomain: "",
-    projectId: "",
-    appId: ""
+    apiKey: "AIzaSyDgHz4KraSAYrASUgrUf_oPP9PYQW8UYi4",
+    authDomain: "mizan-monitor.firebaseapp.com",,
+    projectId: "mizan-monitor",
+    appId: "1:26304069835:web:97f1c29d35e1f3692a9b4e"
   },
   shopId: "mizan"
 };
