@@ -358,6 +358,7 @@ canvas.chart { width: 100%; height: 240px; display: block; }
   };
 
   root.MZ = root.MZ || {};
+  root.MZ.VERSION = '2026-11-26-a';
   root.MZ.U = U;
   if (typeof module !== 'undefined' && module.exports) module.exports = U;
 })(typeof window !== 'undefined' ? window : globalThis);
@@ -1274,9 +1275,10 @@ canvas.chart { width: 100%; height: 240px; display: block; }
   const ready = new Set();
   const log = []; S.log = log;
   const note = (m) => { log.push(new Date().toISOString().slice(11, 23) + ' ' + m); if (log.length > 300) log.shift(); };
-  const state = { mode: 'local', state: 'local', pending: 0, email: '', message: '' };
+  const state = { mode: 'local', state: 'local', pending: 0, email: '', message: '', lastOk: '', lastError: null };
   const listeners = [];
-  function setState(p) { Object.assign(state, p); listeners.forEach((f) => { try { f(state); } catch (e) { /* ignore */ } }); }
+  const errText = (e) => ((e && e.code) ? e.code + ': ' : '') + ((e && e.message) || String(e));
+  function setState(p) { if (p.state === 'error' && p.message) { note('ERROR ' + p.message); p.lastError = { message: p.message, at: U.nowISO() }; } Object.assign(state, p); listeners.forEach((f) => { try { f(state); } catch (e) { /* ignore */ } }); }
   S.state = () => state;
   S.onState = (f) => listeners.push(f);
   S.enabled = () => state.mode === 'cloud';
@@ -1292,8 +1294,10 @@ canvas.chart { width: 100%; height: 240px; display: block; }
     const A = mods[0], Au = mods[1], F = mods[2];
     const app = A.initializeApp(cfg.firebase);
     const auth = Au.getAuth(app);
+    // Memory cache (our own IndexedDB copy is the real local store) + automatic fallback to long-polling,
+    // which fixes uploads that hang on some mobile networks / browsers.
     let db;
-    try { db = F.initializeFirestore(app, { localCache: F.persistentLocalCache({ tabManager: F.persistentMultipleTabManager() }) }); }
+    try { db = F.initializeFirestore(app, { localCache: F.memoryLocalCache(), experimentalAutoDetectLongPolling: true }); }
     catch (e) { db = F.getFirestore(app); }
     const shop = cfg.shopId || 'mizan';
     const toUser = (u) => (u ? { uid: u.uid, email: u.email } : null);
@@ -1303,6 +1307,14 @@ canvas.chart { width: 100%; height: 240px; display: block; }
       signIn: async (email, pw) => toUser((await Au.signInWithEmailAndPassword(auth, email, pw)).user),
       signOut: () => Au.signOut(auth),
       resetPassword: (email) => Au.sendPasswordResetEmail(auth, email),
+      // write a small test record and read it back FROM THE SERVER — proves login, rules, database and network all work
+      ping: async function () {
+        const ref = F.doc(db, 'shops', shop, 'diag', 'ping');
+        const stamp = Date.now();
+        await F.setDoc(ref, { id: 'ping', t: stamp, updatedAt: new Date().toISOString() });
+        const snap = await F.getDocFromServer(ref);
+        if (!snap.exists() || snap.data().t !== stamp) throw new Error('The test record could not be read back.');
+      },
       push: async function (ops) {
         for (let i = 0; i < ops.length; i += 400) {
           const b = F.writeBatch(db);
@@ -1344,6 +1356,11 @@ canvas.chart { width: 100%; height: 240px; display: block; }
     return true;
   };
 
+  S.testConnection = async function () {
+    if (!remote || !user) throw new Error('Not signed in.');
+    if (remote.ping) await withTimeout(remote.ping(), 20000);
+    return true;
+  };
   S.signIn = (email, pw) => remote.signIn(email, pw);
   S.resetPassword = (email) => remote.resetPassword(email);
   S.signOut = async function () {
@@ -1376,11 +1393,12 @@ canvas.chart { width: 100%; height: 240px; display: block; }
     const n = await localRecordCount();
     if (linked && linked.uid !== u.uid) {
       if (n > 0 && hooks.askReplace && !(await hooks.askReplace())) return false;
+      if (n > 0 && hooks.safetyBackup) await hooks.safetyBackup();
       await wipeLocal();
     } else if (n > 0) {
       const choice = hooks.askLink ? await hooks.askLink(n) : 'upload';
       if (choice === 'cancel') return false;
-      if (choice === 'cloud') await wipeLocal(); else await queueEverything();
+      if (choice === 'cloud') { if (hooks.safetyBackup) await hooks.safetyBackup(); await wipeLocal(); } else await queueEverything();
     }
     await DB.setMeta('cloudLinked', { uid: u.uid, email: u.email || '' });
     return true;
@@ -1400,7 +1418,7 @@ canvas.chart { width: 100%; height: 240px; display: block; }
         } catch (e) { console.error('Sync merge failed', e); setState({ state: 'error', message: e.message || String(e) }); }
       }, function (err) {
         console.warn('Sync listener error', err);
-        setState({ state: 'error', message: (err && err.message) || 'Could not reach the cloud.' });
+        setState({ state: 'error', message: errText(err) });
       }));
     });
   }
@@ -1489,11 +1507,11 @@ canvas.chart { width: 100%; height: 240px; display: block; }
           for (const e of batch) { const cur = await s.outbox.get(e.key); if (cur && cur.v === e.v) await s.outbox.delete(e.key); }
         }, { noSync: true });
       }
-      setState({ state: 'ok', pending: 0, message: '' });
+      setState({ state: 'ok', pending: 0, message: '', lastOk: U.nowISO() });
     } catch (err) {
       console.warn('Upload failed', err);
       await refreshPending();
-      setState({ state: 'error', message: (err && err.message) || 'Upload failed' });
+      setState({ state: 'error', message: errText(err) });
       clearTimeout(retryT); retryT = setTimeout(() => kick(0), 20000);
     } finally {
       flushing = false;
@@ -1953,7 +1971,17 @@ canvas.chart { width: 100%; height: 240px; display: block; }
       ? '<div class="card"><h3>Cloud sync</h3><p>Signed in as <b>' + e(st.email || '—') + '</b></p><p class="muted small">Everything you enter is saved on this device first, then uploaded automatically. Every device signed in to this account shows the same records.</p>' +
         '<p id="syncLine">' + (st.pending ? '<b>' + st.pending + '</b> change(s) waiting to upload.' : 'All changes are uploaded.') + '</p><div class="actions"><button class="secondary" id="syncNow">Sync now</button><button class="danger" id="signOut">Sign out</button></div></div>'
       : '<div class="card"><h3>Cloud sync</h3><p>Cloud sync is <b>not set up</b>, so your records are kept on this device only. To use the same records on several devices, follow <b>FIREBASE-SETUP.md</b>.</p></div>';
-    el.innerHTML = '<div class="page-head"><h2>Backup &amp; Transfer</h2></div>' + cloudCard +
+    const diagCard = st.mode !== 'cloud' ? '' :
+      '<div class="card"><h3>Sync check</h3><table><tbody>' +
+      '<tr><td>App version</td><td class="num">' + e(MZ.VERSION) + '</td></tr>' +
+      '<tr><td>Status</td><td class="num">' + e(st.state) + '</td></tr>' +
+      '<tr><td>Waiting to upload</td><td class="num">' + st.pending + '</td></tr>' +
+      '<tr><td>Last successful upload</td><td class="num">' + (st.lastOk ? e(U.formatDateTime(st.lastOk)) : '<b>never</b>') + '</td></tr>' +
+      '<tr><td>Last problem</td><td class="num small">' + (st.lastError ? e(st.lastError.message) + '<br>' + e(U.formatDateTime(st.lastError.at)) : 'none') + '</td></tr>' +
+      '<tr><td>Storage protected</td><td class="num" id="dgPersist">…</td></tr>' +
+      '<tr><td>Records on this device</td><td class="num">' + MZ.Backup.DATA_STORES.reduce((t, n) => t + data[n].length, 0) + '</td></tr></tbody></table>' +
+      '<div class="actions" style="margin-top:12px"><button class="blue" id="dgTest">Test cloud connection</button><button class="secondary" id="dgRetry">Upload now</button></div><div id="dgOut"></div></div>';
+    el.innerHTML = '<div class="page-head"><h2>Backup &amp; Transfer</h2></div>' + cloudCard + diagCard +
       '<div class="banner info">Your records are stored only inside this browser on this device. If you clear browser data or lose the device, they are gone — so save a backup regularly (for example every week).</div>' +
       '<div class="card"><h3>1. Save a backup</h3><p>Downloads one file with <b>all</b> your records (products, stock history, customers, sales, payments, expenses).</p>' +
       '<p class="muted small">Last backup: ' + (last ? e(U.formatDateTime(last.at)) : '<b>never</b>') + '</p><button id="bkExport">Download backup file</button><div id="bkMsg"></div></div>' +
@@ -1962,6 +1990,24 @@ canvas.chart { width: 100%; height: 240px; display: block; }
       '<div class="card"><h3>Move data between PC and phone</h3><ol><li>On the first device: <b>Download backup file</b>.</li><li>Send the file to the other device (WhatsApp “to myself”, email, USB, or Google Drive).</li><li>On the other device: open this app → Backup → choose the file.</li></ol><p class="muted small">Always use the newest file and only keep working on one device at a time, otherwise newer records on the other device would be replaced.</p></div>' +
       '<div class="card"><h3>Stored on this device now</h3><table><tbody>' + MZ.Backup.DATA_STORES.map((n) => '<tr><td>' + labels[n] + '</td><td class="num">' + data[n].length + '</td></tr>').join('') + '</tbody></table></div>';
 
+    if (st.mode === 'cloud') {
+      if (navigator.storage && navigator.storage.persisted) navigator.storage.persisted().then((p) => { const x = $('#dgPersist', el); if (x) x.textContent = p ? 'Yes' : 'No (browser may clean it)'; });
+      const explain = function (m) {
+        m = String(m || '');
+        if (/permission-denied|insufficient permissions/i.test(m)) return 'The cloud refused access. The email you signed in with is not in your Firestore rules (check spelling, lower-case), or the rules were not published.';
+        if (/not-found|failed-precondition|database.*(exist|not)/i.test(m)) return 'The Firestore database has not been created yet. In Firebase open Firestore Database and click Create database.';
+        if (/unavailable|timed out|network|offline/i.test(m)) return 'This device could not reach Google’s servers. Try another connection (Wi-Fi or mobile data) and turn off VPN, data-saver or ad-blocker.';
+        if (/api-key|invalid|project/i.test(m)) return 'Check apiKey and projectId in config.js.';
+        return 'See the message above and send a screenshot of this page.';
+      };
+      $('#dgTest', el).addEventListener('click', async function () {
+        const out = $('#dgOut', el), b = this; b.disabled = true; out.innerHTML = '<p class="muted">Testing… (up to 20 seconds)</p>';
+        try { await MZ.Sync.testConnection(); out.innerHTML = '<div class="banner info" style="margin-top:12px"><b>Connection works.</b> Login, rules and database are all fine.</div>'; }
+        catch (err) { const m = (err && ((err.code ? err.code + ': ' : '') + err.message)) || String(err); out.innerHTML = '<div class="err">' + e(m) + '</div><p>' + e(explain(m)) + '</p>'; }
+        b.disabled = false;
+      });
+      $('#dgRetry', el).addEventListener('click', async () => { await MZ.Sync.flushNow(); UI.toast(MZ.Sync.state().pending ? 'Still waiting — run the connection test.' : 'Everything is uploaded.'); V.backup(el); });
+    }
     const sn = $('#syncNow', el); if (sn) sn.addEventListener('click', async () => { await MZ.Sync.flushNow(); UI.toast(MZ.Sync.state().pending ? 'Still waiting to upload — check your internet.' : 'Everything is uploaded.'); V.backup(el); });
     const so = $('#signOut', el); if (so) so.addEventListener('click', async () => { if (await UI.confirmBox('Sign out?', 'You will need your email and password to sign in again on this device.', 'Sign out')) await MZ.Sync.signOut(); });
     $('#bkExport', el).addEventListener('click', async function () {
@@ -2143,6 +2189,7 @@ canvas.chart { width: 100%; height: 240px; display: block; }
     onSignedIn: async function () { V.hideLogin(); if (!booted) await boot(); else route(); paintHeader(); },
     onSignedOut: function () { V.showLogin(); paintHeader(); },
     onRemoteChange: remoteChanged,
+    safetyBackup: async function () { try { await MZ.Backup.exportToFile(); toast('A safety backup of this device was downloaded first.'); } catch (e) { console.warn(e); } },
     onError: (m) => toast(m, true),
   };
 
@@ -2166,6 +2213,7 @@ canvas.chart { width: 100%; height: 240px; display: block; }
       return;
     }
     MZ.Sync.onState(paintHeader);
+    $('.clock').addEventListener('click', function () { const s = MZ.Sync.state(); if (s.mode === 'cloud') toast(statusText(s) + (s.message ? ' — ' + s.message : ''), s.state === 'error'); });
     paintHeader(); setInterval(paintHeader, 15000);
     window.addEventListener('resize', paintHeader);
 

@@ -1,6 +1,6 @@
 /* Service worker: caches the app so it opens instantly and without internet.
    IMPORTANT: bump CACHE_VERSION whenever you change any file, so devices pick up the update. */
-const CACHE_VERSION = 'mizan-v4';
+const CACHE_VERSION = 'mizan-v5';
 const ASSETS = ['./', './index.html', './config.js', './manifest.webmanifest', './icon.svg', './icon-192.png', './icon-512.png', './icon-maskable-512.png'];
 self.addEventListener('install', (e) => {
   // one missing file must never break the whole install
